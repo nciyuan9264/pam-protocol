@@ -5,6 +5,8 @@ import (
 	"encoding/json"
 	"fmt"
 	"net"
+	"net/url"
+	"strconv"
 	"strings"
 
 	"github.com/bytedance/gopkg/cloud/metainfo"
@@ -17,6 +19,7 @@ const (
 	UserAgentKey    = "x-pam-user-agent"
 	HTTPMethodKey   = "x-pam-http-method"
 	HTTPPathKey     = "x-pam-http-path"
+	HTTPOriginKey   = "x-pam-http-origin"
 	UserIDKey       = "x-pam-user-id"
 	UserRolesKey    = "x-pam-user-roles"
 	UserTokenKey    = "x-pam-user-token"
@@ -27,6 +30,7 @@ const (
 	MaxUserAgentBytes  = 512
 	MaxHTTPMethodBytes = 32
 	MaxHTTPPathBytes   = 4 << 10
+	MaxHTTPOriginBytes = 1024
 	MaxUserIDBytes     = 128
 	MaxRoles           = 32
 	MaxRoleBytes       = 128
@@ -44,6 +48,7 @@ type RequestInfo struct {
 	UserAgent  string
 	HTTPMethod string
 	HTTPPath   string
+	HTTPOrigin string
 }
 
 type contextKey uint8
@@ -75,6 +80,7 @@ func RequestInfoFromContext(ctx context.Context) (RequestInfo, error) {
 		UserAgent:  valueFromMetadata(ctx, UserAgentKey),
 		HTTPMethod: valueFromMetadata(ctx, HTTPMethodKey),
 		HTTPPath:   valueFromMetadata(ctx, HTTPPathKey),
+		HTTPOrigin: func() string { v, _ := metainfo.GetValue(ctx, HTTPOriginKey); return v }(),
 	})
 	return value, validateRequestInfo(value)
 }
@@ -151,6 +157,7 @@ func ClientMiddleware(next endpoint.Endpoint) endpoint.Endpoint {
 		ctx = withMetadataValue(ctx, UserAgentKey, info.UserAgent)
 		ctx = withMetadataValue(ctx, HTTPMethodKey, info.HTTPMethod)
 		ctx = withMetadataValue(ctx, HTTPPathKey, info.HTTPPath)
+		ctx = withMetadataValue(ctx, HTTPOriginKey, info.HTTPOrigin)
 		if identity, ok, err := IdentityFromContext(ctx); err != nil {
 			return err
 		} else if ok {
@@ -228,6 +235,9 @@ func normalizeRequestInfo(value RequestInfo) RequestInfo {
 	value.UserAgent = strings.TrimSpace(value.UserAgent)
 	value.HTTPMethod = strings.ToUpper(strings.TrimSpace(value.HTTPMethod))
 	value.HTTPPath = strings.TrimSpace(value.HTTPPath)
+	if origin, err := NormalizeOrigin(value.HTTPOrigin); err == nil {
+		value.HTTPOrigin = origin
+	}
 	return value
 }
 
@@ -253,7 +263,50 @@ func validateRequestInfo(value RequestInfo) error {
 	if value.HTTPPath != "" && value.HTTPPath[0] != '/' {
 		return fmt.Errorf("invalid HTTP path %q", value.HTTPPath)
 	}
+	if _, err := NormalizeOrigin(value.HTTPOrigin); err != nil {
+		return err
+	}
 	return nil
+}
+
+// NormalizeOrigin accepts only a serialized HTTP(S) origin, null, or an absent origin.
+// The absent value keeps metadata compatible with non-browser RPC callers.
+func NormalizeOrigin(value string) (string, error) {
+	if err := validateText("HTTP origin", value, MaxHTTPOriginBytes); err != nil {
+		return "", err
+	}
+	value = strings.TrimSpace(value)
+	if value == "" || value == "null" {
+		return value, nil
+	}
+	u, err := url.Parse(value)
+	if err != nil || u == nil || u.User != nil || u.Opaque != "" ||
+		u.Hostname() == "" || u.Path != "" || u.RawQuery != "" ||
+		u.ForceQuery || u.Fragment != "" || strings.ContainsAny(value, "?#") ||
+		(u.Scheme != "http" && u.Scheme != "https") {
+		return "", fmt.Errorf("invalid HTTP origin")
+	}
+	host := strings.ToLower(u.Hostname())
+	if strings.ContainsAny(host, " /\\%*") || strings.HasSuffix(u.Host, ":") {
+		return "", fmt.Errorf("invalid HTTP origin host")
+	}
+	port := u.Port()
+	if port != "" {
+		n, err := strconv.Atoi(port)
+		if err != nil || n < 1 || n > 65535 {
+			return "", fmt.Errorf("invalid HTTP origin port")
+		}
+	}
+	if (u.Scheme == "http" && port == "80") || (u.Scheme == "https" && port == "443") {
+		port = ""
+	}
+	if strings.Contains(host, ":") {
+		host = "[" + host + "]"
+	}
+	if port != "" {
+		host += ":" + port
+	}
+	return u.Scheme + "://" + host, nil
 }
 
 func normalizeIdentity(value Identity) Identity {

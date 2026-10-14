@@ -15,6 +15,7 @@ func TestClientMiddlewarePropagatesRequestAndIdentity(t *testing.T) {
 		UserAgent:  "test",
 		HTTPMethod: "patch",
 		HTTPPath:   "/platform/users/7",
+		HTTPOrigin: "https://AUTH.gamebus.online:443",
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -40,7 +41,8 @@ func TestClientMiddlewarePropagatesRequestAndIdentity(t *testing.T) {
 		for key, want := range map[string]string{
 			RequestIDKey: "req-1", ClientIPKey: "203.0.113.4", UserAgentKey: "test",
 			HTTPMethodKey: "PATCH", HTTPPathKey: "/platform/users/7",
-			UserIDKey: "7", UserRolesKey: `["admin"]`, UserTokenKey: "access",
+			HTTPOriginKey: "https://auth.gamebus.online",
+			UserIDKey:     "7", UserRolesKey: `["admin"]`, UserTokenKey: "access",
 			RefreshTokenKey: "refresh", MachineTokenKey: "machine",
 		} {
 			if got, ok := metainfo.GetValue(ctx, key); !ok || got != want {
@@ -142,5 +144,36 @@ func TestMetadataWritersRejectInvalidValues(t *testing.T) {
 	}
 	if _, err := WithMachineToken(context.Background(), strings.Repeat("x", MaxCredentialBytes+1)); err == nil {
 		t.Fatal("expected oversized credential error")
+	}
+}
+
+func TestOriginValidationAndLegacyCalls(t *testing.T) {
+	for input, want := range map[string]string{
+		"": "", "null": "null", "http://localhost:5173": "http://localhost:5173",
+		"https://AUTH.gamebus.online:443": "https://auth.gamebus.online",
+		"http://[::1]:80":                 "http://[::1]",
+	} {
+		got, err := NormalizeOrigin(input)
+		if err != nil || got != want {
+			t.Fatalf("NormalizeOrigin(%q) = %q, %v", input, got, err)
+		}
+	}
+	for _, input := range []string{
+		"https://user@auth.gamebus.online", "https://auth.gamebus.online/",
+		"https://auth.gamebus.online?x=1", "https://auth.gamebus.online#",
+		"https://auth.gamebus.online\n", "file://host", "https://host:99999",
+		strings.Repeat("x", MaxHTTPOriginBytes+1),
+	} {
+		if _, err := NormalizeOrigin(input); err == nil {
+			t.Errorf("accepted invalid origin %q", input)
+		}
+	}
+	ctx := metainfo.WithValue(context.Background(), HTTPOriginKey, "https://auth.gamebus.online")
+	info, err := RequestInfoFromContext(ctx)
+	if err != nil || info.HTTPOrigin != "https://auth.gamebus.online" {
+		t.Fatalf("origin from metadata = %+v, %v", info, err)
+	}
+	if _, err := RequestInfoFromContext(context.Background()); err != nil {
+		t.Fatal(err)
 	}
 }
